@@ -19,6 +19,8 @@ package org.wildfly.transaction.client.naming.txn;
 
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 
 import javax.naming.Binding;
 import javax.naming.Name;
@@ -123,7 +125,9 @@ class TxnNamingContext extends AbstractContext {
     }
 
     private UserTransaction getRemoteUserTransaction() {
-        return RemoteTransactionContext.getInstance().getUserTransaction(namingProvider.getProviderUri(), namingProvider.getSSLContext(), namingProvider.getAuthenticationConfiguration());
+        final List<NamingProvider.Location> locations = namingProvider.getLocations();
+        final NamingProvider.Location location = locations.get(ThreadLocalRandom.current().nextInt(locations.size()));
+        return RemoteTransactionContext.getInstance().getUserTransaction(location.getUri(), location.getSSLContext(), location.getAuthenticationConfiguration());
     }
 
     @Override
