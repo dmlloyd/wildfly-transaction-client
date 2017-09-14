@@ -19,10 +19,10 @@
 package org.wildfly.transaction.client;
 
 import java.io.Serializable;
-import java.net.URI;
-import java.util.List;
 
 import org.wildfly.naming.client.NamingProvider;
+import org.wildfly.naming.client.ProviderEnvironment;
+import org.wildfly.security.auth.client.AuthenticationContext;
 
 /**
  * @author <a href="mailto:david.lloyd@redhat.com">David M. Lloyd</a>
@@ -30,23 +30,16 @@ import org.wildfly.naming.client.NamingProvider;
 final class SerializedUserTransaction implements Serializable {
     private static final long serialVersionUID = - 7197250436320616251L;
 
-    private final URI location;
-
-    SerializedUserTransaction(final URI location) {
-        this.location = location;
+    SerializedUserTransaction() {
     }
 
     Object readResolve() {
+        AuthenticationContext context = AuthenticationContext.captureCurrent();
         final NamingProvider currentNamingProvider = NamingProvider.getCurrentNamingProvider();
         if (currentNamingProvider != null) {
-            final List<NamingProvider.Location> locations = currentNamingProvider.getLocations();
-            for (NamingProvider.Location location : locations) {
-                final URI providerUri = location.getUri();
-                if (providerUri.equals(this.location)) {
-                    return RemoteTransactionContext.getInstancePrivate().getUserTransaction(providerUri, location.getSSLContext(), location.getAuthenticationConfiguration());
-                }
-            }
+            final ProviderEnvironment providerEnvironment = currentNamingProvider.getProviderEnvironment();
+            context = providerEnvironment.getAuthenticationContextSupplier().get();
         }
-        return RemoteTransactionContext.getInstancePrivate().getUserTransaction(location);
+        return context.runFunction(RemoteTransactionContext::getUserTransaction, RemoteTransactionContext.getInstancePrivate());
     }
 }

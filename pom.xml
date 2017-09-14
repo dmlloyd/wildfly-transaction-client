@@ -55,13 +55,31 @@
         <version.org.kohsuke.metainf-services>1.7</version.org.kohsuke.metainf-services>
         <version.org.wildfly.common>1.2.0.Final</version.org.wildfly.common>
         <version.org.wildfly.elytron>1.1.0.Final</version.org.wildfly.elytron>
-        <version.org.wildfly.naming-client>1.0.0.Final</version.org.wildfly.naming-client>
+        <version.org.wildfly.naming-client>1.0.2.Final-SNAPSHOT</version.org.wildfly.naming-client>
+        <version.bridger>1.4.Final</version.bridger>
 
         <maven.compiler.source>1.8</maven.compiler.source>
         <maven.compiler.target>1.8</maven.compiler.target>
     </properties>
 
     <build>
+        <plugins>
+            <plugin>
+                <groupId>org.jboss.bridger</groupId>
+                <artifactId>bridger</artifactId>
+                <version>1.4.Final</version>
+                <executions>
+                    <!-- run after "compile", runs bridger on main classes -->
+                    <execution>
+                        <id>weave</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>transform</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
     </build>
 
     <dependencies>

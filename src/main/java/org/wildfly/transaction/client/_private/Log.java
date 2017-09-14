@@ -354,4 +354,7 @@ public interface Log extends BasicLogger {
 
     @Message(id = 89, value = "Failed to configure transaction timeout of %d")
     SystemException setTimeoutFailed(int timeout, @Cause XAException e);
+
+    @Message(id = 90, value = "Cannot assign location \"%s\" to transaction because it is already located at \"%s\"")
+    IllegalStateException locationAlreadyInitialized(URI newLocation, URI oldLocation);
 }

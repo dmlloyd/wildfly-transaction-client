@@ -19,9 +19,7 @@
 package org.wildfly.transaction.client;
 
 import java.io.Serializable;
-import java.net.URI;
 
-import javax.net.ssl.SSLContext;
 import javax.transaction.HeuristicMixedException;
 import javax.transaction.HeuristicRollbackException;
 import javax.transaction.NotSupportedException;
@@ -30,10 +28,8 @@ import javax.transaction.Status;
 import javax.transaction.SystemException;
 import javax.transaction.UserTransaction;
 
-import org.wildfly.security.auth.client.AuthenticationConfiguration;
+import org.wildfly.security.auth.client.AuthenticationContext;
 import org.wildfly.transaction.client._private.Log;
-import org.wildfly.transaction.client.spi.RemoteTransactionProvider;
-import org.wildfly.transaction.client.spi.SimpleTransactionControl;
 
 /**
  * A remote {@code UserTransaction} which controls the transaction state of a remote system.
@@ -44,14 +40,10 @@ public final class RemoteUserTransaction implements UserTransaction, Serializabl
     private static final long serialVersionUID = 8612109476723652825L;
 
     private final ThreadLocal<State> stateRef = ThreadLocal.withInitial(State::new);
-    private final URI location;
-    private final AuthenticationConfiguration stickyAuthenticationConfiguration;
-    private final SSLContext stickySSLContext;
+    private final AuthenticationContext authenticationContext;
 
-    RemoteUserTransaction(final URI location, final SSLContext stickySSLContext, final AuthenticationConfiguration stickyAuthenticationConfiguration) {
-        this.location = location;
-        this.stickyAuthenticationConfiguration = stickyAuthenticationConfiguration;
-        this.stickySSLContext = stickySSLContext;
+    RemoteUserTransaction(final AuthenticationContext authenticationContext) {
+        this.authenticationContext = authenticationContext;
     }
 
     public void begin() throws NotSupportedException, SystemException {
@@ -60,13 +52,9 @@ public final class RemoteUserTransaction implements UserTransaction, Serializabl
             throw Log.log.nestedNotSupported();
         }
         final RemoteTransactionContext context = RemoteTransactionContext.getInstancePrivate();
-        final RemoteTransactionProvider provider = context.getProvider(location);
-        if (provider == null) {
-            throw Log.log.noProviderForUri(location);
-        }
-        final int timeout = stateRef.get().timeout;
-        final SimpleTransactionControl control = provider.getPeerHandle(location, stickySSLContext, stickyAuthenticationConfiguration).begin(timeout == 0 ? ContextTransactionManager.getGlobalDefaultTransactionTimeout() : timeout);
-        transactionManager.resume(context.notifyCreationListeners(new RemoteTransaction(control, location, timeout), CreationListener.CreatedBy.USER_TRANSACTION));
+        int timeout = stateRef.get().timeout;
+        if (timeout == 0) timeout = ContextTransactionManager.getGlobalDefaultTransactionTimeout();
+        transactionManager.resume(context.notifyCreationListeners(new RemoteTransaction(authenticationContext, timeout), CreationListener.CreatedBy.USER_TRANSACTION));
     }
 
     public void commit() throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, IllegalStateException, SystemException {
@@ -104,25 +92,9 @@ public final class RemoteUserTransaction implements UserTransaction, Serializabl
         return remoteTransaction == null ? Status.STATUS_NO_TRANSACTION : remoteTransaction.getStatus();
     }
 
-    /**
-     * Get the location of this object.
-     *
-     * @return the location of this object
-     */
-    public URI getLocation() {
-        return location;
-    }
-
     RemoteTransaction getMatchingTransaction() {
         final AbstractTransaction transaction = ContextTransactionManager.getInstance().getTransaction();
-        if (! (transaction instanceof RemoteTransaction)) {
-            return null;
-        }
-        final RemoteTransaction remoteTransaction = (RemoteTransaction) transaction;
-        if (! remoteTransaction.getLocation().equals(location)) {
-            return null;
-        }
-        return remoteTransaction;
+        return transaction instanceof RemoteTransaction ? (RemoteTransaction) transaction : null;
     }
 
     public void setTransactionTimeout(final int seconds) throws SystemException {
@@ -136,10 +108,13 @@ public final class RemoteUserTransaction implements UserTransaction, Serializabl
     }
 
     Object writeReplace() {
-        return new SerializedUserTransaction(location);
+        return new SerializedUserTransaction();
     }
 
     static final class State {
         int timeout = 0;
+
+        State() {
+        }
     }
 }

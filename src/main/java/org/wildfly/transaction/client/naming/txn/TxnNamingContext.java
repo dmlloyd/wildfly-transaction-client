@@ -19,8 +19,6 @@ package org.wildfly.transaction.client.naming.txn;
 
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.ThreadLocalRandom;
 
 import javax.naming.Binding;
 import javax.naming.Name;
@@ -33,10 +31,12 @@ import javax.transaction.UserTransaction;
 import org.wildfly.naming.client.AbstractContext;
 import org.wildfly.naming.client.CloseableNamingEnumeration;
 import org.wildfly.naming.client.NamingProvider;
+import org.wildfly.security.auth.client.AuthenticationContext;
 import org.wildfly.transaction.client.ContextTransactionManager;
 import org.wildfly.transaction.client.ContextTransactionSynchronizationRegistry;
 import org.wildfly.transaction.client.LocalUserTransaction;
 import org.wildfly.transaction.client.RemoteTransactionContext;
+import org.wildfly.transaction.client.RemoteUserTransaction;
 
 /**
  * @author <a href="mailto:david.lloyd@redhat.com">David M. Lloyd</a>
@@ -45,8 +45,11 @@ class TxnNamingContext extends AbstractContext {
 
     private static final String TRANSACTION_MANAGER = "TransactionManager";
     private static final String USER_TRANSACTION = "UserTransaction";
+    private static final String REMOTE_USER_TRANSACTION = "RemoteUserTransaction";
+    private static final String LOCAL_USER_TRANSACTION = "LocalUserTransaction";
     private static final String TRANSACTION_SYNCHRONIZATION_REGISTRY = "TransactionSynchronizationRegistry";
     private final NamingProvider namingProvider;
+    private final RemoteUserTransaction remoteUserTransaction = getRemoteUserTransaction();
 
     TxnNamingContext(final NamingProvider namingProvider) {
         this.namingProvider = namingProvider;
@@ -57,10 +60,16 @@ class TxnNamingContext extends AbstractContext {
         switch (str) {
             case USER_TRANSACTION: {
                 if (namingProvider != null) {
-                    return getRemoteUserTransaction();
+                    return remoteUserTransaction;
                 } else {
                     return LocalUserTransaction.getInstance();
                 }
+            }
+            case REMOTE_USER_TRANSACTION: {
+                return remoteUserTransaction;
+            }
+            case LOCAL_USER_TRANSACTION: {
+                return LocalUserTransaction.getInstance();
             }
             case TRANSACTION_MANAGER: {
                 if (namingProvider == null) {
@@ -90,6 +99,8 @@ class TxnNamingContext extends AbstractContext {
             namingProvider == null ?
                 Arrays.asList(
                     nameClassPair(UserTransaction.class),
+                    nameClassPair(RemoteUserTransaction.class),
+                    nameClassPair(LocalUserTransaction.class),
                     nameClassPair(TransactionManager.class),
                     nameClassPair(TransactionSynchronizationRegistry.class)
                 ) :
@@ -104,15 +115,13 @@ class TxnNamingContext extends AbstractContext {
             throw nameNotFound(name);
         }
         return CloseableNamingEnumeration.fromIterable(
-            namingProvider == null ?
-                Arrays.asList(
-                    binding(UserTransaction.class, LocalUserTransaction.getInstance()),
-                    binding(TransactionManager.class, ContextTransactionManager.getInstance()),
-                    binding(TransactionSynchronizationRegistry.class, ContextTransactionSynchronizationRegistry.getInstance())
-                ) :
-                Collections.singleton(
-                    binding(UserTransaction.class, getRemoteUserTransaction())
-                )
+            Arrays.asList(
+                binding(UserTransaction.class, namingProvider != null ? remoteUserTransaction : LocalUserTransaction.getInstance()),
+                binding(RemoteUserTransaction.class, remoteUserTransaction),
+                binding(LocalUserTransaction.class, LocalUserTransaction.getInstance()),
+                binding(TransactionManager.class, ContextTransactionManager.getInstance()),
+                binding(TransactionSynchronizationRegistry.class, ContextTransactionSynchronizationRegistry.getInstance())
+            )
         );
     }
 
@@ -124,10 +133,13 @@ class TxnNamingContext extends AbstractContext {
         return new ReadOnlyBinding(clazz.getSimpleName(), clazz.getName(), content, "txn:" + clazz.getSimpleName());
     }
 
-    private UserTransaction getRemoteUserTransaction() {
-        final List<NamingProvider.Location> locations = namingProvider.getLocations();
-        final NamingProvider.Location location = locations.get(ThreadLocalRandom.current().nextInt(locations.size()));
-        return RemoteTransactionContext.getInstance().getUserTransaction(location.getUri(), location.getSSLContext(), location.getAuthenticationConfiguration());
+    private static RemoteUserTransaction getRemoteUserTransaction() {
+        AuthenticationContext context = AuthenticationContext.captureCurrent();
+        final NamingProvider currentNamingProvider = NamingProvider.getCurrentNamingProvider();
+        if (currentNamingProvider != null) {
+            context = currentNamingProvider.getProviderEnvironment().getAuthenticationContextSupplier().get();
+        }
+        return context.runFunction(RemoteTransactionContext::getUserTransaction, RemoteTransactionContext.getInstance());
     }
 
     @Override

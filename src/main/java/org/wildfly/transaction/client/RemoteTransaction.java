@@ -19,10 +19,13 @@
 package org.wildfly.transaction.client;
 
 import java.net.URI;
+import java.security.AccessController;
+import java.security.GeneralSecurityException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicReference;
 
+import javax.net.ssl.SSLContext;
 import javax.transaction.HeuristicMixedException;
 import javax.transaction.HeuristicRollbackException;
 import javax.transaction.RollbackException;
@@ -32,8 +35,12 @@ import javax.transaction.SystemException;
 import javax.transaction.xa.XAResource;
 
 import org.wildfly.common.Assert;
+import org.wildfly.security.auth.client.AuthenticationConfiguration;
+import org.wildfly.security.auth.client.AuthenticationContext;
+import org.wildfly.security.auth.client.AuthenticationContextConfigurationClient;
 import org.wildfly.transaction.TransactionPermission;
 import org.wildfly.transaction.client._private.Log;
+import org.wildfly.transaction.client.spi.RemoteTransactionProvider;
 import org.wildfly.transaction.client.spi.SimpleTransactionControl;
 
 /**
@@ -42,16 +49,15 @@ import org.wildfly.transaction.client.spi.SimpleTransactionControl;
 public final class RemoteTransaction extends AbstractTransaction {
     private final AtomicReference<State> stateRef;
     private final ConcurrentMap<Object, Object> resources = new ConcurrentHashMap<>();
-    private final URI location;
-    private final Object key = new Key();
-    private final SimpleTransactionControl control;
+    private final AuthenticationContext authenticationContext;
+    private final Object key = new Object();
     private final int timeout;
 
-    RemoteTransaction(final SimpleTransactionControl control, final URI location, final int timeout) {
-        super();
-        stateRef = new AtomicReference<>(new Active());
-        this.location = location;
-        this.control = control;
+    static final AuthenticationContextConfigurationClient CLIENT = AccessController.doPrivileged(AuthenticationContextConfigurationClient.ACTION);
+
+    RemoteTransaction(final AuthenticationContext authenticationContext, final int timeout) {
+        this.authenticationContext = authenticationContext;
+        stateRef = new AtomicReference<>(Unlocated.ACTIVE);
         this.timeout = timeout;
     }
 
@@ -92,11 +98,12 @@ public final class RemoteTransaction extends AbstractTransaction {
         if (sm != null) {
             sm.checkPermission(TransactionPermission.forName("getProviderInterface"));
         }
-        return control.getProviderInterface(providerInterfaceType);
+        return stateRef.get().getProviderInterface(providerInterfaceType);
     }
 
     public void commit() throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, SystemException {
-        stateRef.get().commit();
+        final AtomicReference<State> stateRef = this.stateRef;
+        stateRef.get().commit(stateRef);
     }
 
     void commitAndDissociate() throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, SystemException {
@@ -108,7 +115,8 @@ public final class RemoteTransaction extends AbstractTransaction {
     }
 
     public void rollback() throws IllegalStateException, SystemException {
-        stateRef.get().rollback();
+        final AtomicReference<State> stateRef = this.stateRef;
+        stateRef.get().rollback(stateRef);
     }
 
     void rollbackAndDissociate() throws IllegalStateException, SystemException {
@@ -127,7 +135,8 @@ public final class RemoteTransaction extends AbstractTransaction {
     }
 
     public void setRollbackOnly() throws IllegalStateException, SystemException {
-        stateRef.get().setRollbackOnly();
+        final AtomicReference<State> stateRef = this.stateRef;
+        stateRef.get().setRollbackOnly(stateRef);
     }
 
     public int getStatus() {
@@ -163,41 +172,156 @@ public final class RemoteTransaction extends AbstractTransaction {
     }
 
     public String toString() {
-        return String.format("Remote transaction \"%s\" (delegate=%s)", location, control);
+        return String.format("Remote transaction %s", stateRef.get());
     }
 
     /**
      * Get the location of this remote transaction.
      *
-     * @return the location of this remote transaction (not {@code null})
+     * @return the location of this remote transaction, or {@code null} if it has no location as of yet
      */
     public URI getLocation() {
-        return location;
+        return stateRef.get().getLocation();
+    }
+
+    /**
+     * Attempt to set the location of this transaction, binding it to a remote transport provider.
+     *
+     * @param location the location to set (must not be {@code null})
+     * @throws IllegalArgumentException if there is no provider for the given location (or it is {@code null}), or the
+     *  security context was invalid
+     * @throws IllegalStateException if the transaction is in an invalid state for setting its location
+     * @throws SystemException if the transport could not begin the transaction
+     */
+    public void setLocation(URI location) throws IllegalArgumentException, IllegalStateException, SystemException {
+        Assert.checkNotNullParam("location", location);
+        final RemoteTransactionContext context = RemoteTransactionContext.getInstancePrivate();
+        final RemoteTransactionProvider provider = context.getProvider(location);
+        if (provider == null) {
+            throw Log.log.noProviderForUri(location);
+        }
+        final AuthenticationContextConfigurationClient client = CLIENT;
+        final AuthenticationConfiguration authenticationConfiguration = client.getAuthenticationConfiguration(location, authenticationContext, - 1, "jta", "jboss");
+        final SSLContext sslContext;
+        try {
+            sslContext = client.getSSLContext(location, authenticationContext, "jta", "jboss");
+        } catch (GeneralSecurityException e) {
+            throw new IllegalArgumentException(e);
+        }
+        final SimpleTransactionControl control = provider.getPeerHandle(location, sslContext, authenticationConfiguration).begin(getEstimatedRemainingTime());
+        try {
+            stateRef.get().join(stateRef, location, control);
+        } catch (Throwable t) {
+            try {
+                control.rollback();
+            } catch (Throwable t2) {
+                t2.addSuppressed(t);
+                throw t2;
+            }
+            throw t;
+        }
     }
 
     abstract static class State {
-        abstract void commit() throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, SystemException;
+        State() {
+        }
 
-        abstract void rollback() throws IllegalStateException, SystemException;
+        abstract void join(AtomicReference<State> stateRef, URI location, SimpleTransactionControl control) throws IllegalStateException;
 
-        abstract void setRollbackOnly() throws IllegalStateException, SystemException;
+        abstract void commit(AtomicReference<State> stateRef) throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, SystemException;
+
+        abstract void rollback(AtomicReference<State> stateRef) throws IllegalStateException, SystemException;
+
+        abstract void setRollbackOnly(AtomicReference<State> stateRef) throws IllegalStateException, SystemException;
 
         abstract int getStatus();
 
         abstract void registerSynchronization(Synchronization sync) throws RollbackException, IllegalStateException, SystemException;
 
         abstract void registerInterposedSynchronization(Synchronization sync) throws IllegalStateException;
+
+        <T> T getProviderInterface(final Class<T> providerInterfaceType) {
+            return null;
+        }
+
+        URI getLocation() {
+            return null;
+        }
     }
 
-    abstract class Unresolved extends State {
+    abstract static class Unresolved extends State {
 
         Unresolved() {
         }
 
-        void rollback() throws IllegalStateException, SystemException {
-            final AtomicReference<State> stateRef = RemoteTransaction.this.stateRef;
+        void registerSynchronization(final Synchronization sync) throws RollbackException, IllegalStateException, SystemException {
+            throw Log.log.registerSynchRemoteTransaction();
+        }
+
+        void registerInterposedSynchronization(final Synchronization sync) throws IllegalStateException {
+            throw Log.log.registerSynchRemoteTransaction();
+        }
+    }
+
+    static final class Unlocated extends Unresolved {
+        private final int status;
+
+        static final Unlocated ACTIVE = new Unlocated(Status.STATUS_ACTIVE);
+        static final Unlocated ROLLBACK_ONLY = new Unlocated(Status.STATUS_MARKED_ROLLBACK);
+
+        Unlocated(final int status) {
+            this.status = status;
+        }
+
+        void join(final AtomicReference<State> stateRef, final URI location, final SimpleTransactionControl control) throws IllegalStateException {
+            State newState;
+            switch (status) {
+                case Status.STATUS_ACTIVE: newState = new Active(location, control); break;
+                case Status.STATUS_MARKED_ROLLBACK: newState = new RollbackOnly(location, control); break;
+                default: throw Assert.impossibleSwitchCase(status);
+            }
+            if (stateRef.compareAndSet(this, newState)) {
+                return;
+            } else {
+                stateRef.get().join(stateRef, location, control);
+            }
+        }
+
+        void commit(final AtomicReference<State> stateRef) {
+            stateRef.set(InactiveState.COMMITTED);
+        }
+
+        void rollback(final AtomicReference<State> stateRef) throws IllegalStateException, SystemException {
+            stateRef.set(InactiveState.ROLLED_BACK);
+        }
+
+        void setRollbackOnly(final AtomicReference<State> stateRef) throws IllegalStateException, SystemException {
+            stateRef.set(Unlocated.ROLLBACK_ONLY);
+        }
+
+        int getStatus() {
+            return status;
+        }
+    }
+
+    abstract static class Located extends Unresolved {
+        final URI location;
+        final SimpleTransactionControl control;
+
+        Located(final URI location, final SimpleTransactionControl control) {
+            this.location = location;
+            this.control = control;
+        }
+
+        void join(final AtomicReference<State> stateRef, final URI location, final SimpleTransactionControl control) throws IllegalStateException {
+            if (! this.location.equals(location)) {
+                throw Log.log.locationAlreadyInitialized(location, this.location);
+            }
+        }
+
+        void rollback(final AtomicReference<State> stateRef) throws IllegalStateException, SystemException {
             if (! stateRef.compareAndSet(this, InactiveState.ROLLING_BACK)) {
-                stateRef.get().rollback();
+                stateRef.get().rollback(stateRef);
                 return;
             }
             try {
@@ -212,23 +336,24 @@ public final class RemoteTransaction extends AbstractTransaction {
             stateRef.set(InactiveState.ROLLED_BACK);
         }
 
-        void registerSynchronization(final Synchronization sync) throws RollbackException, IllegalStateException, SystemException {
-            throw Log.log.registerSynchRemoteTransaction();
+        <T> T getProviderInterface(final Class<T> providerInterfaceType) {
+            return control.getProviderInterface(providerInterfaceType);
         }
 
-        void registerInterposedSynchronization(final Synchronization sync) throws IllegalStateException {
-            throw Log.log.registerSynchRemoteTransaction();
+        URI getLocation() {
+            return location;
         }
     }
 
-    final class Active extends Unresolved {
-        Active() {
+    static final class Active extends Located {
+
+        Active(final URI location, final SimpleTransactionControl control) {
+            super(location, control);
         }
 
-        void commit() throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, SystemException {
-            final AtomicReference<State> stateRef = RemoteTransaction.this.stateRef;
+        void commit(final AtomicReference<State> stateRef) throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, SystemException {
             if (! stateRef.compareAndSet(this, InactiveState.COMMITTING)) {
-                stateRef.get().commit();
+                stateRef.get().commit(stateRef);
                 return;
             }
             try {
@@ -250,28 +375,29 @@ public final class RemoteTransaction extends AbstractTransaction {
             return Status.STATUS_ACTIVE;
         }
 
-        void setRollbackOnly() throws IllegalStateException, SystemException {
-            final AtomicReference<State> stateRef = RemoteTransaction.this.stateRef;
+        void setRollbackOnly(final AtomicReference<State> stateRef) throws IllegalStateException, SystemException {
             synchronized (stateRef) {
                 // there's no "marking rollback" state
-                final RollbackOnly newState = new RollbackOnly();
+                final RollbackOnly newState = new RollbackOnly(location, control);
                 if (! stateRef.compareAndSet(this, newState)) {
-                    stateRef.get().setRollbackOnly();
+                    stateRef.get().setRollbackOnly(stateRef);
                 }
                 control.setRollbackOnly();
             }
         }
     }
 
-    final class RollbackOnly extends Unresolved {
-        RollbackOnly() {}
+    static final class RollbackOnly extends Located {
+        RollbackOnly(final URI location, final SimpleTransactionControl control) {
+            super(location, control);
+        }
 
-        void commit() throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, SystemException {
-            rollback();
+        void commit(final AtomicReference<State> stateRef) throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, SystemException {
+            rollback(stateRef);
             throw Log.log.rollbackOnlyRollback();
         }
 
-        void setRollbackOnly() {
+        void setRollbackOnly(final AtomicReference<State> stateRef) {
             // no operation
         }
 
@@ -298,15 +424,19 @@ public final class RemoteTransaction extends AbstractTransaction {
             this.status = status;
         }
 
-        void commit() throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, SystemException {
+        void join(final AtomicReference<State> stateRef, final URI location, final SimpleTransactionControl control) throws IllegalStateException {
             throw Log.log.notActive();
         }
 
-        void rollback() throws IllegalStateException, SystemException {
+        void commit(final AtomicReference<State> stateRef) throws RollbackException, HeuristicMixedException, HeuristicRollbackException, SecurityException, SystemException {
             throw Log.log.notActive();
         }
 
-        void setRollbackOnly() throws IllegalStateException, SystemException {
+        void rollback(final AtomicReference<State> stateRef) throws IllegalStateException, SystemException {
+            throw Log.log.notActive();
+        }
+
+        void setRollbackOnly(final AtomicReference<State> stateRef) throws IllegalStateException, SystemException {
             if (status != Status.STATUS_ROLLING_BACK) {
                 throw Log.log.notActive();
             }
@@ -322,27 +452,6 @@ public final class RemoteTransaction extends AbstractTransaction {
 
         void registerInterposedSynchronization(final Synchronization sync) throws IllegalStateException {
             throw Log.log.notActive();
-        }
-    }
-
-    class Key {
-        Key() {
-        }
-
-        public int hashCode() {
-            return location.hashCode();
-        }
-
-        public boolean equals(final Object obj) {
-            return obj instanceof Key && equals((Key) obj);
-        }
-
-        private boolean equals(final Key key) {
-            return location.equals(key.getLocation());
-        }
-
-        private URI getLocation() {
-            return location;
         }
     }
 }
